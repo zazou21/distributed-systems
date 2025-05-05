@@ -10,6 +10,10 @@ from bs4 import BeautifulSoup
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
 from pymongo import MongoClient
+import re
+from urllib.parse import urlparse
+from urllib.robotparser import RobotFileParser
+
 
 # Setup logging
 logging.basicConfig(
@@ -17,6 +21,29 @@ logging.basicConfig(
 )
 
 logging.getLogger("pika").setLevel(logging.WARNING)
+
+
+blocked_patterns = [
+    r".*login.*",  #  "login"
+    r".*signup.*",  # "signup"
+    r".*terms-of-service.*",  #  "terms-of-service"
+    r".*privacy-policy.*",  #  "privacy-policy"
+    r".*\.js$",  #  ".js"
+    r".*\.css$",  #  ".css"
+    r".*\.jpg$",  #  ".jpg"
+    r".*\.png$",  #  ".png"
+    r".*404.*",  # (error page)
+    r".*403.*",  # (error page)
+    r".*utm_.*",  # (tracking parameters)
+]
+
+
+def is_blocked(url):
+    """Check if the URL matches any blocked patterns."""
+    for pattern in blocked_patterns:
+        if re.search(pattern, url):
+            return True
+    return False
 
 
 @dataclass
@@ -156,8 +183,37 @@ class CrawlerNode:
         self.fetcher = PageFetcher(config)
         self.indexer = IndexerClient(config.sqs_queue_url)
         self.mongo_client = MongoClient("mongodb://172.31.82.224:27017")
-        self.db = self.mongo_client["crawlerDB"]
+        self.db = self.mongo_client["mongoDB"]
         self._shutdown_flag = False
+
+    def _is_allowed_by_robots(self, url, domain):
+        """Check if the URL is allowed by the robots.txt of the domain."""
+        robot_url = f"http://{domain}/robots.txt"
+        rp = RobotFileParser()
+        rp.set_url(robot_url)
+        rp.read()
+
+        # Extract the path from the URL to check if it's disallowed
+        path = urlparse(url).path
+        return rp.can_fetch("*", path)
+
+    def _filter_urls(self, urls, base_url):
+        """Filter out URLs that are blocked or disallowed by robots.txt."""
+        domain = urlparse(base_url).hostname
+
+        filtered_urls = []
+        for url in urls:
+            if is_blocked(url):
+                logging.info(f"Blocked URL: {url}")
+                continue
+
+            if not self._is_allowed_by_robots(url, domain):
+                logging.info(f"Disallowed by robots.txt: {url}")
+                continue
+
+            filtered_urls.append(url)
+
+        return filtered_urls
 
     def save_to_mongo(self, url: str, html: str):
         try:
@@ -208,13 +264,21 @@ class CrawlerNode:
                 return
 
             content = self.fetcher.extract_content(html, url)
-            self.save_to_mongo(url, html)
-            logging.info("sent to mongo")
+            content["extracted_urls"] = self._filter_urls(
+                content["extracted_urls"], url
+            )
+            try:
+                self.save_to_mongo(subtask_id, url, html)
+                logging.info("sent to mongo")
+            except Exception as e:
+                logging.error(f"MongoDB save failed: {e}")
+
             self.indexer.send_to_indexer(url, content["text"])
 
             reporter.report_status(
                 subtask_id, crawler_ip, "DONE", {"url": url, **content}
             )
+
             reporter.report_urls(
                 content.get("extracted_urls", [])[:3],
                 self.queue_name,

@@ -1,0 +1,19 @@
+ama teftah el mara eli gaya
+
+1-zawed logic queues eli hatwasal lel db (momken queues + buffers)
+2-setup el service eli hatsta2bel mel queue fi node mongodb
+3-zabat code el indexers yeb3at status updates 3ashan el fault tolerance
+4-zabat prometheus metrics 3ala master node (as3ab 7eta ghaleban)
+5-7awel tezabat backup el master node
+5-test 3ala el crawler el waheeda
+6-test 3ala el cluster ama el implementation tebaa tamam
+7-ama kol haga tebaa tamam 7awel tezabat roles we access aws
+8-finito?
+
+open questions:
+eh el metrics eli han7tagha
+hal hane7tag buffer 3ashan el db wala la2
+hal ha7tag aseparate el db le 3 ec2s badal docker 
+
+future aspirations:
+ci cd autoscaling
