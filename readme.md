@@ -36,12 +36,17 @@ This project was developed as part of the **Distributed Systems** course (Senior
    
 
 ## Files to view
-These are the files used in the actual ec2 machines
-new-master-node.py
-crawler.py
-indexer.py
-mongo_db_node.py
-server.py
-google.html works as client interface
+-  new-master-node.py
+-  crawler.py
+-  indexer.py 
+-  mongo_db_node.py
+-  server.py
+-  google.html works as client interface
+
+   
+
+  
+  
+  
 
 
