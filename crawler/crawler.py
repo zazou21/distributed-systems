@@ -158,17 +158,30 @@ class Reporter:
             f"Reported {len(new_urls)} new URLs from {parent_subtask_id} at depth {depth}"
         )
 
+    def report_db(self, subtask_id: str, url: str, html: str):
+        self.report(
+            "subtask_registry",
+            {
+                "subtask_id": subtask_id,
+                "url": url,
+                "html": html,
+            },
+        )
+        logging.info(f"Reported HTML to DB for {subtask_id}")
+
 
 class IndexerClient:
     def __init__(self, queue_url: str):
         self.sqs = boto3.client("sqs", region_name="us-east-1")
         self.queue_url = queue_url
 
-    def send_to_indexer(self, url: str, text: str):
+    def send_to_indexer(self, url: str, text: str, subtask_id: str):
         try:
             self.sqs.send_message(
                 QueueUrl=self.queue_url,
-                MessageBody=json.dumps({"url": url, "text": text}),
+                MessageBody=json.dumps(
+                    {"url": url, "text": text, "subtask_id": subtask_id}
+                ),
                 MessageGroupId="crawler-group",
                 MessageDeduplicationId=str(hash(url)),
             )
@@ -215,11 +228,14 @@ class CrawlerNode:
 
         return filtered_urls
 
-    def save_to_mongo(self, url: str, html: str):
+    def save_to_mongo(self, url: str, html: str, subtask_id: str):
+        """Send the content to MongoDB queue."""
+        reporter = Reporter(self.config)
         try:
-            self.db["extracted_html"].insert_one({"url": url, "extracted_html": html})
+            reporter.report_db(subtask_id, url, html)
+
         except Exception as e:
-            logging.error(f"MongoDB save failed: {e}")
+            logging.error(f"Failed to send to MongoDB: {e}")
 
     def _setup_rabbitmq(self):
         """Create a new connection for message consumption"""
@@ -247,12 +263,14 @@ class CrawlerNode:
 
     def _handle_message(self, ch, method, properties, body):
         reporter = Reporter(self.config)
-        try:
 
+        try:
             subtask_id, url, crawler_ip, depth = body.decode().split("|")
             logging.info(f"Processing {subtask_id} for {url}")
 
             reporter.report_status(subtask_id, crawler_ip, "PROCESSING")
+
+            start_time = time.time()  # Start timing
 
             html = self.fetcher.fetch_page(url)
             time.sleep(self.config.crawl_delay)
@@ -267,16 +285,24 @@ class CrawlerNode:
             content["extracted_urls"] = self._filter_urls(
                 content["extracted_urls"], url
             )
+
             try:
-                self.save_to_mongo(subtask_id, url, html)
+                self.save_to_mongo(url, html, subtask_id)
                 logging.info("sent to mongo")
             except Exception as e:
                 logging.error(f"MongoDB save failed: {e}")
 
-            self.indexer.send_to_indexer(url, content["text"])
+            self.indexer.send_to_indexer(url, content["text"], subtask_id)
+            logging.info(f"sent to indexer {subtask_id}")
+
+            end_time = time.time()
+            crawling_time = end_time - start_time  # Calculate duration
 
             reporter.report_status(
-                subtask_id, crawler_ip, "DONE", {"url": url, **content}
+                subtask_id,
+                crawler_ip,
+                "DONE",
+                {"url": url, "crawling_time": crawling_time, **content},
             )
 
             reporter.report_urls(
@@ -285,7 +311,6 @@ class CrawlerNode:
                 subtask_id,
                 int(depth) + 1,
             )
-
         except Exception as e:
             logging.error(f"Message processing failed: {e}")
 

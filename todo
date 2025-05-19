@@ -1,14 +1,20 @@
 ama teftah el mara eli gaya
 
 1-zawed logic queues eli hatwasal lel db (momken queues + buffers)
-2-setup el service eli hatsta2bel mel queue fi node mongodb
+5-zabat prometheus metrics 3ala master node (as3ab 7eta ghaleban)
+6-7awel tezabat backup el master node
+7-test 3ala el crawler el waheeda
+8-test 3ala el cluster ama el implementation tebaa tamam
+9-ama kol haga tebaa tamam 7awel tezabat roles we access aws
+10-finito?
+11-profit?
+
+done_but_not_tested
+
+2-setup el service eli hatsta2bel mel queue fi node mongodb 
 3-zabat code el indexers yeb3at status updates 3ashan el fault tolerance
-4-zabat prometheus metrics 3ala master node (as3ab 7eta ghaleban)
-5-7awel tezabat backup el master node
-5-test 3ala el crawler el waheeda
-6-test 3ala el cluster ama el implementation tebaa tamam
-7-ama kol haga tebaa tamam 7awel tezabat roles we access aws
-8-finito?
+4-zabat el indexers yerelate lel different elasticsearch nodes 
+
 
 open questions:
 eh el metrics eli han7tagha
@@ -16,4 +22,34 @@ hal hane7tag buffer 3ashan el db wala la2
 hal ha7tag aseparate el db le 3 ec2s badal docker 
 
 future aspirations:
-ci cd autoscaling
+ci cd for pushing the code and rebuilding the images
+using terraform for auto deployment for configured ec2s
+autoscaling
+
+
+
+
+
+
+
+
+ya3ni delwaaty ana 3andi collections tasks, subtasks, crawlers, indexers
+
+ama neegy neb3at lel db
+
+el flow eh baaa
+
+awel haga on task we subtask mel master creation dol a7esehom critical yetbe3to fi sanyetha
+
+we 3adi ba2i data el master tetb3et 3al queue kol shewaya
+
+crawler we indexer yeb3ato status updates 3ala el queue
+
+manteky?
+a3taked
+i hope
+yarab azaker rtos
+yarab mashrou3 el rtos yekhlas lewahdo
+
+
+

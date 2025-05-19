@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Distributed Search Engine</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #f9f9f9; padding: 40px; max-width: 800px; margin: auto; }
+    h1 { color: #333; }
+    label, input, textarea, button { width: 100%; margin: 10px 0; }
+    input, textarea { padding: 10px; font-size: 1em; }
+    button { background: #4285f4; color: white; padding: 10px; border: none; font-size: 1em; cursor: pointer; }
+    button:hover { background: #357ae8; }
+    .response { margin-top: 20px; }
+  </style>
+</head>
+<body>
+
+<h1>Distributed Search Engine</h1>
+
+<form id="crawl-form">
+  <h3>Start Web Crawling</h3>
+  <label for="seeds">Seed URLs (comma separated):</label>
+  <textarea id="seeds" rows="3" placeholder="http://example.com, http://example.org"></textarea>
+
+  <label for="depth">Crawling Depth:</label>
+  <input type="number" id="depth" value="2" min="1" max="10">
+
+  <button type="submit">Start Crawling</button>
+</form>
+
+<form id="search-form" style="display: none;">
+  <h3>Search the Index</h3>
+  <label for="query">Search Query:</label>
+  <input type="text" id="query" placeholder="Search...">
+
+  <button type="submit">Search</button>
+</form>
+
+<div class="response" id="response"></div>
+
+<!-- Include Socket.IO client -->
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script>
+  const crawlForm = document.getElementById('crawl-form');
+  const searchForm = document.getElementById('search-form');
+  const responseDiv = document.getElementById('response');
+
+  let taskId = null;
+  const socket = io('http://18.212.186.207:5000');  
+
+  crawlForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const seeds = document.getElementById('seeds').value.split(',').map(s => s.trim());
+    const depth = parseInt(document.getElementById('depth').value);
+
+    const res = await fetch('http://18.212.186.207:5000/start-crawl', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ seeds, depth })
+    });
+
+    const result = await res.json();
+    taskId = result.task_id;
+    responseDiv.innerText = `Crawl started. Task ID: ${taskId}`;
+
+    // Register task to receive updates
+    socket.emit('register_task', { task_id: taskId });
+  });
+
+  socket.on('task_update', (data) => {
+    if (data.task_id === taskId) {
+      if (data.status === 'COMPLETED') {
+        responseDiv.innerText = `Task ${taskId} is complete. You can now search.`;
+        searchForm.style.display = 'block';
+      } else {
+        responseDiv.innerText = `Task ${taskId} status: ${data.status}`;
+      }
+    }
+  });
+
+  searchForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const query = document.getElementById('query').value;
+
+    
+    const res = await fetch('http://18.212.186.207:5000/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query })
+    });
+
+    const result = await res.json();
+    
+if (!Array.isArray(result.results)) {
+  console.error("Invalid format:", result);
+  responseDiv.innerHTML = "<p>Error: Unexpected response format.</p>";
+  return;
+}
+console.log("Search results:", result.results);
+const seenUrls = new Set();
+const uniqueResults = result.results.filter(entry => {
+  if (seenUrls.has(entry.url)) {
+    return false;
+  }
+  seenUrls.add(entry.url);
+  return true;
+});
+
+responseDiv.innerHTML = '<h4>Search Results:</h4><ul>' +
+  uniqueResults.map(entry =>
+    `<li><a href="${entry.url}" target="_blank">${entry.url}</a><p>${entry.snippet}</p></li>`
+  ).join('') +
+  '</ul>';
+  });
+</script>
+
+</body>
+</html>

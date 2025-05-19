@@ -29,7 +29,8 @@ RABBITMQ_CREDS = pika.PlainCredentials("admin", "admin")
 HEARTBEAT_INTERVAL = 300  # 5 minutes
 CONNECTION_TIMEOUT = 300  # 5 minutes
 
-mongo_client = MongoClient("mongodb://172.31.82.224:27017")
+mongo_client = MongoClient("mongodb://mongo1:27017,mongo2:27018/?replicaSet=rs0")
+
 db = mongo_client["distributedDB"]
 subtask_collection = db["subtasks"]
 task_collection = db["tasks"]
@@ -47,12 +48,13 @@ class NodeStatus(Enum):
 class TaskStatus(Enum):
     PENDING = "PENDING"
     IN_PROGRESS = "IN_PROGRESS"
+    PARTIALLY_COMPLETED = "PARTIALLY_COMPLETED"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
 
 
 class SubtaskStatus(Enum):
-    QUEUED = "QUEUED"
+    QUEUED_FOR_CRAWLING = "QUEUED_FOR_CRAWLING"
     ASSIGNED = "ASSIGNED"
     CRAWLER_PROCESSING = "CRAWLER_PROCESSING"
     DONE_CRAWLING = "DONE_CRAWLING"
@@ -60,6 +62,60 @@ class SubtaskStatus(Enum):
     INDEXER_PROCESSING = "INDEXER_PROCESSING"
     ERROR_INDEXING = "ERROR_INDEXING"
     DONE = "DONE"
+
+
+##########################################################          PROMETHEUS METRICS             #################################################
+# Counts
+TASK_SUCCESS_COUNT = Counter(
+    "task_success_count", "Number of successfully completed subtasks"
+)
+
+TASK_ERROR_COUNT = Counter("task_error_count", "Number of subtasks that ended in error")
+
+NODE_FAILURE_COUNT = Counter(
+    "node_failure_count", "Number of nodes that failed to respond"
+)
+
+# Timing
+CRAWLING_TIME = Histogram(
+    "crawling_duration_seconds",
+    "Time taken to crawl a URL",
+    buckets=[0.1, 0.5, 1, 2, 5, 10, 30, 60],
+)
+
+INDEXING_TIME = Histogram(
+    "indexing_duration_seconds",
+    "Time taken to index a page",
+    buckets=[0.1, 0.5, 1, 2, 5, 10],
+)
+
+TOTAL_TASK_TIME = Histogram(
+    "total_task_duration_seconds",
+    "Total time taken to complete a full task",
+    buckets=[1, 5, 10, 30, 60, 120, 300],
+)
+
+CRAWLING_END2END_LATENCY = Histogram(
+    "crawling_turnaround_seconds",
+    "time taken for a subtask to finish crawling including queue communication ",
+)
+
+INDEXING_END2END_LATENCY = Histogram(
+    "indexing_turnaround_seconds",
+    "time taken for a subtask to finish indexing including queue communication",
+)
+
+
+# Real-time tracking
+ACTIVE_CRAWLING_SUBTASKS = Gauge(
+    "active_crawling_subtasks", "Current number of subtasks being crawled"
+)
+
+ACTIVE_INDEXING_SUBTASKS = Gauge(
+    "active_indexing_subtasks", "Current number of subtasks being indexed"
+)
+
+PENDING_SUBTASKS = Gauge("pending_subtasks", "Current number of subtasks in queue")
 
 
 ######################################################         GLOBAL VARIABLES             #################################################
@@ -73,7 +129,11 @@ task_map_lock = threading.Lock()
 completed_tasks_lock = threading.Lock()
 crawler_map_lock = threading.Lock()
 indexer_map_lock = threading.Lock()
+subtask_map_lock = threading.Lock()
 sqs = boto3.client("sqs", region_name="us-east-1")
+master_server_queue_url = (
+    "https://sqs.us-east-1.amazonaws.com/022499012946/queue-master-server.fifo"
+)
 queue_url = "https://sqs.us-east-1.amazonaws.com/022499012946/first-sqs-queue.fifo"
 
 
@@ -101,6 +161,7 @@ class RabbitMQManager:
             )
             crawler_channel.queue_declare(queue="crawler_registry", durable=False)
             crawler_channel.queue_declare(queue="crawler_updates", durable=False)
+            crawler_channel.queue_declare(queue="crawler_urls", durable=False)
 
             return crawler_channel, connection
 
@@ -145,7 +206,29 @@ class RabbitMQManager:
             db_channel.exchange_declare(
                 exchange="db_exchange", exchange_type="direct", durable=False
             )
-            db_channel.queue_declare(queue="db_requests", durable=False)
+
+            db_channel.queue_declare(queue="crawlers", durable=False)
+            db_channel.queue_declare(queue="indexers", durable=False)
+            db_channel.queue_declare(queue="task_registry", durable=False)
+            db_channel.queue_declare(queue="subtask_registry", durable=False)
+
+            db_channel.queue_bind(
+                exchange="db_exchange",
+                queue="task_registry",
+                routing_key="task_registry",
+            )
+            db_channel.queue_bind(
+                exchange="db_exchange",
+                queue="subtask_registry",
+                routing_key="subtask_registry",
+            )
+            db_channel.queue_bind(
+                exchange="db_exchange", queue="crawlers", routing_key="crawlers"
+            )
+            db_channel.queue_bind(
+                exchange="db_exchange", queue="indexers", routing_key="indexers"
+            )
+
             return db_channel, connection
 
     @classmethod
@@ -203,6 +286,33 @@ class RabbitMQManager:
                 time.sleep(2**attempt)
         return False
 
+    @classmethod
+    def db_publish_message(cls, exchange, routing_key, body, max_retries=3):
+        """Thread-safe message publishing with retries"""
+        for attempt in range(max_retries):
+            try:
+                db_channel, connection = cls.get_db_channel()
+                try:
+                    db_channel.basic_publish(
+                        exchange="",
+                        routing_key=routing_key,
+                        body=body,
+                        properties=pika.BasicProperties(
+                            delivery_mode=2,
+                        ),
+                    )
+                    connection.close()
+                    return True
+                except pika.exceptions.AMQPError as e:
+                    logging.error(f"AMQP error: {str(e)}")
+                    connection.close()
+                    return False
+
+            except Exception as e:
+                logging.error(f"Publish failed (attempt {attempt+1}): {str(e)}")
+                time.sleep(2**attempt)
+        return False
+
 
 #######################################################          TASK STRUCTURE             #################################################
 
@@ -213,12 +323,36 @@ class Subtask:
         self.parent_task_id = parent_task_id
         self.url = url
         self.assigned_crawler: Optional[str] = None
-        self.status = SubtaskStatus.QUEUED
+        self.status = SubtaskStatus.QUEUED_FOR_CRAWLING
         self.depth = depth
-        self.subtasks: List[Subtask] = []
+        self.subtasks: List[str] = []
         self.assigned_indexer: Optional[str] = None
+        self.creation_time = time.time()
         self.crawling_time = None
+        self.end_crawling_time = None
         self.indexing_time = None
+        self.end_time = None
+
+    @classmethod
+    def from_dict(cls, data):
+
+        subtask = cls(
+            parent_task_id=data.get("parent_task_id", ""),
+            url=data.get("url", ""),
+            depth=data.get("depth", 0),
+        )
+        subtask.id = data.get("id", subtask.id)
+        subtask.assigned_crawler = data.get("assigned_crawler")
+        subtask.status = data.get("status", subtask.status)
+        subtask.subtasks = data.get("subtasks", [])
+        subtask.assigned_indexer = data.get("assigned_indexer")
+        subtask.creation_time = data.get("creation_time", subtask.creation_time)
+        subtask.crawling_time = data.get("crawling_time")
+        subtask.end_crawling_time = data.get("end_crawling_time")
+        subtask.indexing_time = data.get("indexing_time")
+        subtask.end_time = data.get("end_time")
+
+        return subtask
 
     def assign_to_crawler(self, crawler_ip: str):
         self.assigned_crawler = crawler_ip
@@ -241,48 +375,137 @@ class Subtask:
 
 
 class Task:
-    def __init__(self, seeds: List[str]):
-        self.id = str(uuid.uuid4())
+    def __init__(self, id, seeds: List[str]):
+        self.id = id
         self.seeds = seeds
         self.status = TaskStatus.PENDING
-        self.subtasks: List[Subtask] = []
-        self.completion_time = None
+        self.subtasks: List[str] = []
         self.start_time = time.time()
+        self.completion_time = None
+        self.creation_time = time.time()
+        self.sent_message = False
+
+    @classmethod
+    def from_dict(cls, data):
+        task = cls(seeds=data["seeds"], id=data["id"])
+        task.id = data.get("id", task.id)
+        task.status = TaskStatus[data.get("status", task.status.name)]
+        task.subtasks = data.get("subtasks", [])
+        task.start_time = data.get("start_time", task.start_time)
+        task.completion_time = data.get("completion_time", None)
+        task.creation_time = data.get("creation_time", task.creation_time)
+        task.sent_message = (
+            data.get("sent_message", task.sent_message)
+            if data.get("sent_message")
+            else False
+        )
+        return task
 
     def create_subtasks(self):
-        self.subtasks = [Subtask(parent_task_id=self.id, url=url) for url in self.seeds]
+        for url in self.seeds:
+            subtask = Subtask(parent_task_id=self.id, url=url)
+            self.subtasks.append(subtask.id)
+            subtask_map[subtask.id] = subtask
+            subtask_data = subtask.__dict__
+            subtask_data = enum_to_str(subtask_data)
+            success = RabbitMQManager.db_publish_message(
+                exchange="",
+                routing_key="subtask_registry",
+                body=f"{json.dumps(subtask_data)}",
+            )
+            if success:
+                logging.info(f"Published subtask {subtask.id} to DB")
+
+            else:
+                logging.error(f"Failed to publish subtask {subtask.id} to DB")
+
         self.status = TaskStatus.IN_PROGRESS
         logging.info(f"Created {len(self.subtasks)} subtasks for Task {self.id}")
 
-    def all_subtasks_done(self, subtasks):
-        for st in subtasks:
-            if st.status != SubtaskStatus.DONE:
-                return False
+    def subtask_completion_ratio(self, subtasks_ids, visited=None):
+        if visited is None:
+            visited = set()
+
+        done = 0
+        total = 0
+
+        # Use a local copy to avoid race conditions
+        with subtask_map_lock:
+            subtasks_to_process = [
+                subtask_map.get(st_id) for st_id in subtasks_ids if st_id not in visited
+            ]
+            # Filter out None values in case subtasks were deleted
+            subtasks_to_process = [st for st in subtasks_to_process if st]
+
+        for st in subtasks_to_process:
+            if st.id in visited:
+                continue
+
+            visited.add(st.id)
+            total += 1
+
+            if st.status in (
+                SubtaskStatus.DONE,
+                SubtaskStatus.ERROR_CRAWLING,
+                SubtaskStatus.ERROR_INDEXING,
+            ):
+                done += 1
+
             if st.subtasks:
-                if not self.all_subtasks_done(st.subtasks):
-                    return False
-        return True
+                sub_done, sub_total = self.subtask_completion_ratio(
+                    st.subtasks, visited
+                )
+                done += sub_done
+                total += sub_total
+
+        return done, total
 
     def check_completion(self):
-        if self.all_subtasks_done(self.subtasks):
+        done, total = self.subtask_completion_ratio(self.subtasks)
+        if total == 0:
+            return
+
+        ratio = done / total
+
+        if ratio >= 0.4:
+            self.status = TaskStatus.PARTIALLY_COMPLETED
+            try:
+                if not self.sent_message:
+                    response = sqs.send_message(
+                        QueueUrl=master_server_queue_url,
+                        MessageBody=json.dumps(
+                            {"task_id": self.id, "status": "COMPLETED"}
+                        ),
+                        MessageGroupId="master-server-group",
+                        MessageDeduplicationId=str(uuid.uuid4()),
+                    )
+                    logging.info(
+                        f"Sent task completion to server queue | Task ID: {self.id} | MessageId: {response.get('MessageId')}"
+                    )
+                    self.sent_message = True
+            except Exception as e:
+                logging.error(
+                    f"Failed to notify server of task completion | Task ID: {self.id} | Error: {str(e)}"
+                )
+
+        if ratio >= 0.99:
             self.status = TaskStatus.COMPLETED
             self.completion_time = time.time() - self.start_time
-
-            with task_map_lock:
-                task_map.pop(self.id, None)
-
-            with completed_tasks_lock:
-                completed_tasks[self.id] = self
-
+            task_map.pop(self.id, None)
+            completed_tasks[self.id] = self
+            TOTAL_TASK_TIME.observe(self.completion_time)
             logging.info(f"Task {self.id} is complete.")
+
+            # Send task completion notification to server
 
 
 def monitor_completion():
     while True:
-        for task in list(task_map.values()):
-            if task.status == TaskStatus.IN_PROGRESS:
+        logging.info("Checking for completed tasks...")
+        with task_map_lock:
+            for task in list(task_map.values()):
                 task.check_completion()
-        time.sleep(2)
+        time.sleep(5)
 
 
 #################################################          SLAVES             #################################################
@@ -294,6 +517,14 @@ class Crawler:
         self.status = NodeStatus.IDLE
         self.assigned_subtasks: List[str] = []
         self.last_ping = time.time()
+
+    @classmethod
+    def from_dict(cls, data):
+        crawler = cls(ip=data["ip"])
+        crawler.status = data.get("status", crawler.status)
+        crawler.assigned_subtasks = data.get("assigned_subtasks", [])
+        crawler.last_ping = data.get("last_ping", crawler.last_ping)
+        return crawler
 
     def assign_task(self, subtask_id: str):
         self.assigned_subtasks.append(subtask_id)
@@ -314,14 +545,24 @@ class Indexer:
         self.assigned_subtasks: List[str] = []
         self.last_ping = time.time()
 
+    @classmethod
+    def from_dict(cls, data):
+        indexer = cls(ip=data["ip"])
+        indexer.status = data.get("status", indexer.status)
+        indexer.assigned_subtasks = data.get("assigned_subtasks", [])
+        indexer.last_ping = data.get("last_ping", indexer.last_ping)
+        return indexer
+
+    def assign_task(self, subtask_id: str):
+        self.assigned_subtasks.append(subtask_id)
+        self.status = NodeStatus.RUNNING
+
     def mark_idle(self):
         self.status = NodeStatus.IDLE
 
     def mark_failed(self):
         self.status = NodeStatus.FAILED
 
-
-##########################################################          PROMETHEUS METRICS             #################################################
 
 ##################################################          HANDLERS             #################################################
 
@@ -335,7 +576,7 @@ def handle_crawler_registration(ch, method, properties, body):
         qn = msg["queue_name"]
         now = msg.get("timestamp", time.time())
 
-        with crawler_map_lock():
+        with crawler_map_lock:
             if qn not in crawler_map:
                 crawler_map[qn] = Crawler(qn)
                 logging.info(f"Registered crawler {qn}")
@@ -371,7 +612,7 @@ def handle_indexer_registration(ch, method, properties, body):
         qn = msg["queue_name"]
         now = msg.get("timestamp", time.time())
 
-        with indexer_map_lock():
+        with indexer_map_lock:
             if qn not in indexer_map:
                 indexer_map[qn] = Indexer(qn)
                 logging.info(f"Registered indexer {qn}")
@@ -407,7 +648,7 @@ def start_indexer_registration_listener():
 
 
 def get_least_loaded_crawler() -> Optional[Crawler]:
-    with threading.Lock():
+    with crawler_map_lock:
         valid_crawlers = [
             c for c in crawler_map.values() if c.status != NodeStatus.FAILED
         ]
@@ -417,7 +658,7 @@ def get_least_loaded_crawler() -> Optional[Crawler]:
 
 
 def get_least_loaded_indexer() -> Optional[Indexer]:
-    with threading.Lock():
+    with indexer_map_lock:
         valid_indexers = [
             i for i in indexer_map.values() if i.status != NodeStatus.FAILED
         ]
@@ -427,49 +668,69 @@ def get_least_loaded_indexer() -> Optional[Indexer]:
 
 
 ##################################################         HEALTH MONITORS             #################################################
+def assign_queued_subtasks():
+    while True:
+        with subtask_map_lock, crawler_map_lock:
+            for subtask in list(subtask_map.values()):
+                if subtask.status == SubtaskStatus.QUEUED_FOR_CRAWLING:
+                    crawler = get_least_loaded_crawler()
+                    if crawler:
+                        subtask.assign_to_crawler(crawler.ip)
+                        crawler.assign_task(subtask.id)
+
+                        success = RabbitMQManager.crawler_publish_message(
+                            exchange="crawler_exchange",
+                            routing_key=crawler.ip,
+                            body=f"{subtask.id}|{subtask.url}|{crawler.ip}|{subtask.depth}",
+                        )
+                        if success:
+                            logging.info(f"Dispatched {subtask.id} to {crawler.ip}")
+                            ACTIVE_CRAWLING_SUBTASKS.inc()
+                        else:
+                            logging.error(f"Failed to dispatch {subtask.id}")
+        time.sleep(10)
 
 
 def crawler_health_monitor(timeout=60):
     logging.info("Health monitor started")
     while True:
         now = time.time()
-        with threading.Lock():
 
-            for qn, crawler in list(crawler_map.items()):
-                if (
-                    now - crawler.last_ping > timeout
-                    and crawler.status != NodeStatus.FAILED
-                ):
-                    logging.info(
-                        f"{qn} timed out, reassigning {len(crawler.assigned_subtasks)} subtasks"
-                    )
-                    crawler.status = NodeStatus.FAILED
+        for qn, crawler in list(crawler_map.items()):
+            if (
+                now - crawler.last_ping > timeout
+                and crawler.status != NodeStatus.FAILED
+            ):
 
-                    if crawler.assigned_subtasks:
+                logging.info(
+                    f"{qn} timed out, reassigning {len(crawler.assigned_subtasks)} subtasks"
+                )
+                crawler.status = NodeStatus.FAILED
+                NODE_FAILURE_COUNT.inc()
 
-                        for st_id in crawler.assigned_subtasks[:]:  # Iterate over copy
-                            sub = subtask_map.get(st_id)
-                            if not sub:
-                                continue
+                if crawler.assigned_subtasks:
 
-                            sub.status = SubtaskStatus.QUEUED
-                            new_crawler = get_least_loaded_crawler()
-                            if new_crawler:
-                                sub.assign_to_crawler(new_crawler.ip)
-                                new_crawler.assign_task(sub.id)
-                                success = RabbitMQManager.crawler_publish_message(
-                                    exchange="crawler_exchange",
-                                    routing_key=new_crawler.ip,
-                                    body=f"{sub.id}|{sub.url}|{new_crawler.ip}|{sub.depth}",
-                                )
-                                if success:
-                                    logging.info(
-                                        f"Reassigned {sub.id} to {new_crawler.ip}"
-                                    )
-                                else:
-                                    logging.error(f"Failed to reassign {sub.id}")
+                    for st_id in crawler.assigned_subtasks[:]:  # Iterate over copy
+                        sub = subtask_map.get(st_id)
+                        if not sub:
+                            continue
 
-                        crawler.assigned_subtasks.clear()
+                        sub.status = SubtaskStatus.QUEUED_FOR_CRAWLING
+                        new_crawler = get_least_loaded_crawler()
+                        if new_crawler:
+                            sub.assign_to_crawler(new_crawler.ip)
+                            new_crawler.assign_task(sub.id)
+                            success = RabbitMQManager.crawler_publish_message(
+                                exchange="crawler_exchange",
+                                routing_key=new_crawler.ip,
+                                body=f"{sub.id}|{sub.url}|{new_crawler.ip}|{sub.depth}",
+                            )
+                            if success:
+                                logging.info(f"Reassigned {sub.id} to {new_crawler.ip}")
+                            else:
+                                logging.error(f"Failed to reassign {sub.id}")
+
+                    crawler.assigned_subtasks.clear()
         time.sleep(timeout / 2)
 
 
@@ -479,8 +740,10 @@ def indexer_health_monitor():
         now = time.time()
         for qn, indexer in list(indexer_map.items()):
             if now - indexer.last_ping > 60 and indexer.status != NodeStatus.FAILED:
+
                 logging.info(f"{qn} timed out, marking as failed")
                 indexer.status = NodeStatus.FAILED
+                NODE_FAILURE_COUNT.inc()
                 for st_id in indexer.assigned_subtasks[:]:  # Iterate over copy
                     try:
                         subtask_info = subtask_collection.find_one({"id": st_id})
@@ -496,7 +759,7 @@ def indexer_health_monitor():
                     new_indexer = get_least_loaded_indexer()
                     if new_indexer:
                         subtask = subtask_map.get(st_id)
-                        subtask.status = SubtaskStatus.QUEUED
+                        subtask.status = SubtaskStatus.QUEUED_FOR_INDEXING
                         subtask.assigned_indexer = new_indexer.ip
                         new_indexer.assigned_subtasks.append(st_id)
                         success = RabbitMQManager.crawler_publish_message(
@@ -526,12 +789,16 @@ def handle_crawler_updates(ch, method, properties, body):
         status = message["status"]
         data = message.get("data", {})
 
-        logging.info(f"Update from {crawler_ip}: Subtask {subtask_id} -> {status}")
+        logging.info(
+            f"Update from crawler {crawler_ip}: Subtask {subtask_id} -> {status}"
+        )
 
-        with threading.Lock():
+        with subtask_map_lock:
             subtask = subtask_map.get(subtask_id)
             if not subtask:
                 logging.warning(f"Unknown subtask {subtask_id}")
+                return
+            if subtask.status == SubtaskStatus.DONE:
                 return
 
             crawler = crawler_map.get(crawler_ip)
@@ -543,13 +810,27 @@ def handle_crawler_updates(ch, method, properties, body):
                 subtask.mark_crawler_processing()
             elif status == "DONE":
                 subtask.mark_done_crawling()
+                crawling_time = data.get("crawling_time", 0)
+                subtask.crawling_time = crawling_time
+                subtask.end_crawling_time = time.time()
+                turnaround = subtask.end_crawling_time - subtask.creation_time
+                CRAWLING_TIME.observe(crawling_time)
+                CRAWLING_END2END_LATENCY.observe(turnaround)
+                ACTIVE_CRAWLING_SUBTASKS.dec()
+                ACTIVE_INDEXING_SUBTASKS.inc()
+
                 if subtask_id in crawler.assigned_subtasks:
                     crawler.assigned_subtasks.remove(subtask_id)
             elif status == "ERROR":
-                subtask.mark_crawler_error()
+                subtask.mark_error_crawling()
                 if subtask_id in crawler.assigned_subtasks:
                     crawler.assigned_subtasks.remove(subtask_id)
                 crawler.mark_idle()
+                subtask.end_crawling_time = time.time()
+                turnaround = subtask.end_crawling_time - subtask.creation_time
+                CRAWLING_END2END_LATENCY.observe(turnaround)
+                ACTIVE_CRAWLING_SUBTASKS.dec()
+                TASK_ERROR_COUNT.inc()
     except Exception as e:
         logging.error(f"Error in update handler: {str(e)}")
 
@@ -563,7 +844,12 @@ def handle_crawler_new_urls(ch, method, properties, body):
             return
         crawler_ip = message["crawler_ip"]
         urls = message["urls"]
-        depth = int(message["depth"])
+
+        parent_subtask = subtask_map.get(parent_subtask_id)
+        if not parent_subtask:
+            logging.warning(f"Unknown parent subtask {parent_subtask_id}")
+            return
+        depth = parent_subtask.depth + 1
 
         if depth >= 3:
             logging.info(f"Depth limit reached for {parent_subtask_id}")
@@ -571,19 +857,16 @@ def handle_crawler_new_urls(ch, method, properties, body):
 
         logging.info(f"New URLs from {crawler_ip}: {len(urls)} URLs")
 
-        with threading.Lock():
-            parent_subtask = subtask_map.get(parent_subtask_id)
-            if not parent_subtask:
-                logging.warning(f"Unknown parent subtask {parent_subtask_id}")
-                return
+        with subtask_map_lock:
 
             for url in urls:
-                parent_subtask.subtasks.append(url)
+
                 new_subtask = Subtask(
                     parent_task_id=parent_subtask.parent_task_id,
                     url=url,
-                    depth=depth + 1,
+                    depth=depth,
                 )
+                parent_subtask.subtasks.append(new_subtask.id)
                 subtask_map[new_subtask.id] = new_subtask
 
                 assigned_crawler = get_least_loaded_crawler()
@@ -600,6 +883,7 @@ def handle_crawler_new_urls(ch, method, properties, body):
                         logging.info(
                             f"Dispatched {new_subtask.id} to {assigned_crawler.ip}"
                         )
+                        ACTIVE_CRAWLING_SUBTASKS.inc()
                     else:
                         logging.error(f"Failed to dispatch {new_subtask.id}")
     except Exception as e:
@@ -646,7 +930,10 @@ def handle_indexer_updates(ch, method, properties, body):
         subtask_id = message["subtask_id"]
         indexer_ip = message["indexer_ip"]
         status = message["status"]
-
+        data = message.get("data", {})
+        logging.info(
+            f"Update from indexer {indexer_ip}: Subtask {subtask_id} -> {status}"
+        )
         with threading.Lock():
             subtask = subtask_map.get(subtask_id)
             if not subtask:
@@ -661,8 +948,20 @@ def handle_indexer_updates(ch, method, properties, body):
 
             elif status == "DONE":
                 subtask.mark_done_indexing()
+                indexer = indexer_map.get(indexer_ip)
+                if indexer and subtask_id in indexer.assigned_subtasks:
+                    indexer.assigned_subtasks.remove(subtask_id)
+                subtask.indexing_time = data.get("indexing_time", 0)
+                subtask.end_time = time.time()
+                turnaround = subtask.end_time - subtask.end_crawling_time
+                TASK_SUCCESS_COUNT.inc()
+                INDEXING_TIME.observe(subtask.indexing_time)
+                INDEXING_END2END_LATENCY.observe(turnaround)
+                ACTIVE_INDEXING_SUBTASKS.dec()
             elif status == "ERROR":
                 subtask.mark_error_indexing()
+                ACTIVE_INDEXING_SUBTASKS.dec()
+                TASK_ERROR_COUNT.inc()
 
     except Exception as e:
         logging.error(f"Error in indexer update handler: {str(e)}")
@@ -685,6 +984,103 @@ def start_indexer_update_listener():
             )
             time.sleep(5)
             continue
+
+
+##############################################              BACKUP                     ################################################
+
+
+def enum_to_str(data):
+    """Converts enum values to their string representations."""
+    for key, value in data.items():
+        if isinstance(value, Enum):
+            data[key] = value.name  # Convert enum to its name (string)
+    return data
+
+
+def periodic_master_backup():
+    while True:
+        try:
+            with task_map_lock:
+                for task in list(task_map.values()):
+                    task_data = task.__dict__
+                    task_data = enum_to_str(task_data)  # Convert enums to strings
+                    task_collection.update_one(
+                        {"id": task.id}, {"$set": task_data}, upsert=True
+                    )
+        except Exception as e:
+            logging.error(f"Error during task backup: {str(e)}")
+        try:
+            with subtask_map_lock:
+                for subtask in list(subtask_map.values()):
+                    subtask_data = subtask.__dict__
+                    subtask_data = enum_to_str(subtask_data)  # Convert enums to strings
+                    subtask_collection.update_one(
+                        {"subtask_id": subtask.id}, {"$set": subtask_data}, upsert=True
+                    )
+        except Exception as e:
+            logging.error(f"Error during subtask backup: {str(e)}")
+        try:
+            with crawler_map_lock:
+                for crawler in list(crawler_map.values()):
+                    crawler_data = crawler.__dict__
+                    crawler_data = enum_to_str(crawler_data)  # Convert enums to strings
+                    crawler_collection.update_one(
+                        {"crawler_ip": crawler.ip}, {"$set": crawler_data}, upsert=True
+                    )
+        except Exception as e:
+            logging.error(f"Error during crawler backup: {str(e)}")
+        try:
+            with indexer_map_lock:
+                for indexer in list(indexer_map.values()):
+                    indexer_data = indexer.__dict__
+                    indexer_data = enum_to_str(indexer_data)  # Convert enums to strings
+                    indexer_collection.update_one(
+                        {"indexer_ip": indexer.ip}, {"$set": indexer_data}, upsert=True
+                    )
+            logging.info("Master backup completed")
+
+        except Exception as e:
+            logging.error(f"Error during indexer backup: {str(e)}")
+
+        time.sleep(180)
+
+
+def get_backup_data():
+    try:
+        # Load tasks
+        for task_doc in task_collection.find():
+            task_doc.pop("_id", None)
+            task = Task.from_dict(task_doc)
+            with task_map_lock:
+                task_map[task.id] = task
+
+            # Load subtasks
+            for subtask_doc in subtask_collection.find():
+                try:
+                    subtask_doc.pop("_id", None)
+                    subtask = Subtask.from_dict(subtask_doc)
+                    with subtask_map_lock:
+                        subtask_map[subtask.id] = subtask
+                except Exception as e:
+                    continue
+
+        # Load crawlers
+        for crawler_doc in crawler_collection.find():
+            crawler_doc.pop("_id", None)
+            crawler = Crawler.from_dict(crawler_doc)
+            with crawler_map_lock:
+                crawler_map[crawler.ip] = crawler
+
+        # Load indexers
+        for indexer_doc in indexer_collection.find():
+            indexer_doc.pop("_id", None)
+            indexer = Indexer.from_dict(indexer_doc)
+            with indexer_map_lock:
+                indexer_map[indexer.ip] = indexer
+
+        logging.info("Master backup successfully loaded from MongoDB")
+    except Exception as e:
+        logging.error(f"Error loading backup data: {str(e)}")
 
 
 ######################################################      MASTER PROCESS             #################################################
@@ -710,17 +1106,32 @@ def master_process():
                         body = json.loads(message["Body"])
                         seed_urls = body.get("seeds", [])
                         depth = body.get("depth", 1)
+                        id = body.get("task_id")
 
                         logging.info(f"New task: {len(seed_urls)} seeds, depth={depth}")
-                        task = Task(seed_urls)
-                        with threading.Lock():
+                        task = Task(id, seed_urls)
+
+                        task_data = task.__dict__
+                        task_data = enum_to_str(task_data)  # Convert enums to strings
+
+                        success = RabbitMQManager.db_publish_message(
+                            exchange="",
+                            routing_key="task_registry",
+                            body=json.dumps(task_data),
+                        )
+                        if not success:
+                            logging.error(f"Failed to publish task {task.id} to DB")
+                        elif success:
+                            logging.info(f"Published task {task.id} to DB")
+
+                        with task_map_lock:
                             task_map[task.id] = task
 
                         task.create_subtasks()
 
                         with threading.Lock():
-                            for subtask in task.subtasks:
-                                subtask_map[subtask.id] = subtask
+                            for subtask_id in task.subtasks:
+                                subtask = subtask_map.get(subtask_id)
                                 crawler = get_least_loaded_crawler()
                                 if crawler:
                                     subtask.assign_to_crawler(crawler.ip)
@@ -739,12 +1150,20 @@ def master_process():
                                         logging.error(
                                             f"Failed to dispatch {subtask.id}"
                                         )
+                                else:
+                                    logging.info(
+                                        f"No available crawlers for subtask {subtask.id}"
+                                    )
+                                    continue
 
                         sqs.delete_message(
                             QueueUrl=queue_url, ReceiptHandle=message["ReceiptHandle"]
                         )
                     except Exception as e:
                         logging.error(f"Error processing SQS message: {str(e)}")
+                        sqs.delete_message(
+                            QueueUrl=queue_url, ReceiptHandle=message["ReceiptHandle"]
+                        )
 
             time.sleep(1)
         except Exception as e:
@@ -756,6 +1175,9 @@ def master_process():
 
 
 if __name__ == "__main__":
+    get_backup_data()
+    start_http_server(8000)
+    Thread(target=periodic_master_backup, daemon=True).start()
     Thread(target=start_crawler_registration_listener, daemon=True).start()
     Thread(target=start_indexer_registration_listener, daemon=True).start()
     Thread(target=crawler_health_monitor, daemon=True).start()
@@ -764,5 +1186,6 @@ if __name__ == "__main__":
     Thread(target=start_crawler_urls_listener, daemon=True).start()
     Thread(target=start_indexer_update_listener, daemon=True).start()
     Thread(target=monitor_completion, daemon=True).start()
+    # Thread(target=assign_queued_subtasks, daemon=True).start()
 
     master_process()
