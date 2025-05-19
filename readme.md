@@ -29,6 +29,11 @@ This project was developed as part of the **Distributed Systems** course (Senior
    Connect via SSH and run:
    ```bash
    docker start mongo1 mongo2 queue_service
+2. **Launch elastic search ec2s (3 nodes)**
+3. **Deploy nodes**:
+   - Master node
+   - Worker nodes (scale as needed with kubernetes deployments)
+   
 
 ## Files to view
 These are the files used in the actual ec2 machines
@@ -39,29 +44,4 @@ mongo_db_node.py
 server.py
 google.html works as client interface
 
-## Features
 
-- Distributed architecture with multiple nodes
-- Inter-node communication using RabbitMQ , Amazon SQS queues
-- Fault tolerance mechanisms
-- Data consistency and synchronization
-
-
-## Technologies Used
-
-- Programming Language: Python
-- Docker
-- Kubernetes: For scalable worker nodes on ec2 machines
-- MongoDB Replicaset
-- elastic search 
-- Prometheus/Grafana monitoring
-
-
-## Usage
-
-- First launch ec2 instances for RabbitMQ, MongoDB node (connect through ssh and run docker start mongo1 mongo2 queue_service) , 3 elastic search nodes
-- Launch master node , worker nodes , scale worker nodes as needed using kubernetes deployment scaling
-
-## License
-
-This project is for educational purposes.
